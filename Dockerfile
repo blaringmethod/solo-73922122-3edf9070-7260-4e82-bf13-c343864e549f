@@ -11,6 +11,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
 COPY scripts ./scripts
+COPY samples ./samples
 
 RUN useradd --create-home --uid 10001 bomuser \
     && mkdir -p /data \

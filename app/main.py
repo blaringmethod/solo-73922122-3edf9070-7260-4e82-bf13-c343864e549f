@@ -11,11 +11,18 @@ import time
 from contextlib import asynccontextmanager
 from typing import Any, Callable, Mapping
 
-from fastapi import Body, FastAPI, Query, Request
+from fastapi import Body, FastAPI, File, Query, Request, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
+from .conversion import (
+    ConversionError,
+    check_conversion,
+    parse_detail_csv,
+    parse_rules_csv,
+    valid_rows_csv,
+)
 from .demo import DEMO_EDGES, INTERLEAVE_A, INTERLEAVE_B, PROMOTE_LEAF_OPS
 from .store import (
     MAX_EDGES,
@@ -29,6 +36,7 @@ from .store import (
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MAX_DEMO_PAUSE = 15.0
+MAX_UPLOAD_BYTES = 5 * 1024 * 1024  # 单个上传 CSV 5MB 上限
 
 
 def create_app(
@@ -64,6 +72,13 @@ def create_app(
         if paths:
             payload["paths"] = paths
         return JSONResponse(status_code=exc.status_code, content=payload)
+
+    @app.exception_handler(ConversionError)
+    async def conversion_error_handler(_: Request, exc: ConversionError) -> JSONResponse:
+        return JSONResponse(
+            status_code=422,
+            content={"error": str(exc), "code": "ConversionError"},
+        )
 
     def state_payload() -> dict[str, Any]:
         snapshot = active_store.snapshot()
@@ -178,6 +193,69 @@ def create_app(
                 for top, count in sorted(by_top.items())
             ],
         }
+
+    async def _read_upload(upload: UploadFile | None, label: str) -> bytes:
+        if upload is None or not upload.filename:
+            raise ConversionError(f"缺少{label}文件")
+        data = await upload.read()
+        if len(data) > MAX_UPLOAD_BYTES:
+            raise ConversionError(f"{label}超过 {MAX_UPLOAD_BYTES // 1024 // 1024}MB 上限")
+        return data
+
+    @app.post("/api/conversion/check")
+    async def conversion_check(
+        detail_csv: UploadFile | None = File(default=None),
+        rules_csv: UploadFile | None = File(default=None),
+    ) -> dict[str, Any]:
+        """领料明细换算核查（无状态）。
+
+        已发布 BOM 版本与叶件集合在同一只读事务内解析一次，整份报告只依据
+        该版本；另一 Web 进程同时批改，只会在下次核查时看到新版本。
+        """
+        detail_raw = await _read_upload(detail_csv, "领料明细 CSV")
+        rules_raw = await _read_upload(rules_csv, "换算规则 CSV")
+        lines = parse_detail_csv(detail_raw)
+        rules = parse_rules_csv(rules_raw)
+        snapshot = active_store.published_snapshot()
+        report = check_conversion(
+            lines,
+            rules,
+            snapshot["leaf_parts"],
+            snapshot["version_seq"],
+        )
+        report["published_at"] = snapshot["published_at"]
+        report["instance"] = active_instance
+        return report
+
+    @app.post("/api/conversion/valid-rows.csv")
+    async def conversion_valid_csv(
+        detail_csv: UploadFile | None = File(default=None),
+        rules_csv: UploadFile | None = File(default=None),
+    ) -> Response:
+        """同口径再核查一次，仅把有效行作为标准件数 CSV 下载（单版本快照）。"""
+        detail_raw = await _read_upload(detail_csv, "领料明细 CSV")
+        rules_raw = await _read_upload(rules_csv, "换算规则 CSV")
+        lines = parse_detail_csv(detail_raw)
+        rules = parse_rules_csv(rules_raw)
+        snapshot = active_store.published_snapshot()
+        report = check_conversion(
+            lines,
+            rules,
+            snapshot["leaf_parts"],
+            snapshot["version_seq"],
+        )
+        body = valid_rows_csv(report)
+        filename = f"standard_piece_qty_v{snapshot['version_seq']}.csv"
+        return Response(
+            content=body,
+            media_type="text/csv; charset=utf-8",
+            headers={
+                "Content-Disposition": f'attachment; filename="{filename}"',
+                "X-Bom-Version": str(snapshot["version_seq"]),
+                "X-Valid-Rows": str(report["counts"]["valid"]),
+                "Cache-Control": "no-store",
+            },
+        )
 
     @app.post("/api/demo/seed")
     def seed_demo_endpoint() -> dict[str, Any]:

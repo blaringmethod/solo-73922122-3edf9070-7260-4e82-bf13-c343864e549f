@@ -646,6 +646,26 @@ class BomStore:
             writer.writerow([row["top_part"], row["leaf_part"], row["qty"], head["version_seq"]])
         return buffer.getvalue(), int(head["version_seq"])
 
+    def published_snapshot(self) -> dict[str, Any]:
+        """Resolve the published version and its leaf set in ONE read transaction.
+
+        A conversion-check request calls this once and keeps the returned
+        ``version_seq``/``leaf_parts`` for the whole report, so concurrent
+        batch commits by another web process can never make the report mix two
+        BOM versions.  A part is a leaf when it appears as a child but never
+        as a parent in the published edges.
+        """
+        with self.reader() as conn:
+            head = self._head(conn)
+            edges = self._load_edges(conn, head["version_seq"])
+            parents = {edge.parent for edge in edges}
+            leaves = frozenset(edge.child for edge in edges if edge.child not in parents)
+            return {
+                "version_seq": int(head["version_seq"]),
+                "published_at": head["updated_at"],
+                "leaf_parts": leaves,
+            }
+
     # -- writes ------------------------------------------------------------
 
     def commit_batch(

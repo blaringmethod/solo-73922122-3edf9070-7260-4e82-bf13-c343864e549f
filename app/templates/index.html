@@ -89,6 +89,44 @@
       </table>
     </div>
   </section>
+
+  <section class="panel panel-wide">
+    <div class="panel-head">
+      <h2>领料明细换算核查</h2>
+      <div class="hint">
+        供应商按箱/包报送，精确换算成 BOM 标准单位「<b>件</b>」。只处理当前已发布 BOM 的叶件；
+        全程有理数精确计算，核查始终依据同一个已提交 BOM 版本。
+      </div>
+    </div>
+    <div class="form-row">
+      <label class="file-label">领料明细 CSV（line_id, leaf_part, unit, qty）
+        <input type="file" id="file-detail" accept=".csv,text/csv">
+      </label>
+      <label class="file-label">料号专属换算 CSV（leaf_part, from_unit, to_unit, numerator, denominator）
+        <input type="file" id="file-rules" accept=".csv,text/csv">
+      </label>
+      <button class="primary" id="btn-conversion-check">执行换算核查</button>
+      <button class="ghost" id="btn-conversion-download" disabled>下载有效行 CSV</button>
+    </div>
+    <div class="hint" id="conversion-hint">
+      规则语义：1 from_unit = numerator/denominator to_unit，可双向、跨级推导；
+      例：箱→包=10、包→件=12，则 1 箱 = 120 件。
+    </div>
+    <div id="conversion-alert" class="alert hidden"></div>
+    <div id="conversion-conflicts" class="cycle hidden"></div>
+    <div class="summary" id="conversion-summary"></div>
+    <div class="table-wrap tall">
+      <table>
+        <thead>
+          <tr>
+            <th>原行号</th><th>line_id</th><th>叶件</th><th>单位</th><th>原数量</th>
+            <th>标准件数</th><th>倍率</th><th>BOM 版本</th><th>状态 / 原因</th>
+          </tr>
+        </thead>
+        <tbody id="conversion-body"></tbody>
+      </table>
+    </div>
+  </section>
 </main>
 
 <footer>

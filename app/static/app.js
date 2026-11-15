@@ -4,6 +4,8 @@
     parts: [],
     demoMode: false,
     busy: false,
+    conversionFiles: { detail: null, rules: null },
+    conversionReport: null,
   };
 
   const $ = (id) => document.getElementById(id);
@@ -285,6 +287,146 @@
     }
   }
 
+  // -- 领料换算核查 -------------------------------------------------------
+
+  const STATUS_LABEL = {
+    valid: ["有效", "st-valid"],
+    quarantined: ["隔离", "st-quarantine"],
+    rejected: ["拒收", "st-reject"],
+  };
+
+  function showConversionAlert(message, kind = "err") {
+    const box = $("conversion-alert");
+    box.textContent = message;
+    box.className = `alert ${kind}`;
+    box.classList.remove("hidden");
+  }
+
+  function hideConversionAlert() {
+    $("conversion-alert").classList.add("hidden");
+  }
+
+  function renderConversionConflicts(report) {
+    const box = $("conversion-conflicts");
+    if (!report.conflicts.length) {
+      box.classList.add("hidden");
+      box.innerHTML = "";
+      return;
+    }
+    const items = report.conflicts
+      .map((conflict) => {
+        const paths = conflict.paths.map((p) => `<li>${esc(p)}</li>`).join("");
+        const rules = conflict.rules
+          .map((r) => `<li>${esc(r.leaf_part)}：${esc(r.from_unit)}→${esc(r.to_unit)} = ${esc(r.numerator)}/${esc(r.denominator)}</li>`)
+          .join("");
+        return (
+          `<li><b>${esc(conflict.leaf_part)}</b> 单位 ${esc(conflict.unit)} 到「件」倍率不一致：` +
+          `${esc(conflict.rates.join(" vs "))}<ul class="conflict-inner">路径：${paths}涉及规则：${rules}</ul></li>`
+        );
+      })
+      .join("");
+    box.innerHTML = `<h4>换算规则矛盾，相关料号的全部明细已隔离（其他料号照常产出）</h4><ul>${items}</ul>`;
+    box.classList.remove("hidden");
+  }
+
+  function renderConversionReport(report) {
+    state.conversionReport = report;
+    const c = report.counts;
+    $("conversion-summary").innerHTML =
+      `<span class="chip">BOM 版本 <b>v${esc(report.bom_version_seq)}</b></span>` +
+      `<span class="chip">明细行 <b>${report.total_lines}</b></span>` +
+      `<span class="chip st-valid">有效 <b>${c.valid}</b></span>` +
+      `<span class="chip st-quarantine">隔离 <b>${c.quarantined}</b></span>` +
+      `<span class="chip st-reject">拒收 <b>${c.rejected}</b></span>` +
+      `<span class="chip">发布时间 <b>${esc(report.published_at || "-")}</b></span>`;
+    renderConversionConflicts(report);
+
+    const body = $("conversion-body");
+    body.innerHTML = "";
+    report.rows.forEach((row) => {
+      const [label, cls] = STATUS_LABEL[row.status] || [row.status, ""];
+      const tr = document.createElement("tr");
+      const pathText = row.path && row.path.length
+        ? row.path.map((step) => `${esc(step.from_unit)}→${esc(step.to_unit)}`).join("，")
+        : "";
+      const reason = row.reason
+        ? `<div class="reason">${esc(row.reason)}</div>${pathText ? `<div class="hint">${pathText}</div>` : ""}`
+        : (pathText ? `<div class="hint">${pathText}</div>` : "");
+      tr.innerHTML =
+        `<td class="num">${esc(row.source_row)}</td>` +
+        `<td class="mono">${esc(row.line_id)}</td>` +
+        `<td class="mono">${esc(row.leaf_part)}</td>` +
+        `<td class="mono">${esc(row.unit)}</td>` +
+        `<td class="num">${esc(row.qty_text)}</td>` +
+        `<td class="num"><b>${row.standard_qty === null ? "—" : esc(row.standard_qty)}</b></td>` +
+        `<td class="mono">${esc(row.factor || "—")}</td>` +
+        `<td class="mono">${row.bom_version_seq === null ? "—" : "v" + esc(row.bom_version_seq)}</td>` +
+        `<td><span class="status-pill ${cls}">${label}</span>${reason}</td>`;
+      body.appendChild(tr);
+    });
+    $("btn-conversion-download").disabled = c.valid === 0;
+  }
+
+  async function runConversionCheck() {
+    const detail = state.conversionFiles.detail;
+    const rules = state.conversionFiles.rules;
+    if (!detail || !rules) {
+      showConversionAlert("请先选择领料明细 CSV 与换算规则 CSV 两个文件。");
+      return;
+    }
+    hideConversionAlert();
+    setStatus("换算核查中…");
+    const form = new FormData();
+    form.append("detail_csv", detail);
+    form.append("rules_csv", rules);
+    try {
+      const response = await fetch("/api/conversion/check", { method: "POST", body: form });
+      const data = await response.json();
+      if (!response.ok) {
+        showConversionAlert(data.error || `HTTP ${response.status}`);
+        setStatus("核查失败", "err");
+        return;
+      }
+      renderConversionReport(data);
+      setStatus("核查完成", "ok");
+    } catch (error) {
+      showConversionAlert(error.message);
+      setStatus("核查失败", "err");
+    }
+  }
+
+  async function downloadValidRows() {
+    const detail = state.conversionFiles.detail;
+    const rules = state.conversionFiles.rules;
+    if (!detail || !rules) {
+      showConversionAlert("请先选择两个 CSV 文件。");
+      return;
+    }
+    const form = new FormData();
+    form.append("detail_csv", detail);
+    form.append("rules_csv", rules);
+    try {
+      const response = await fetch("/api/conversion/valid-rows.csv", { method: "POST", body: form });
+      if (!response.ok) {
+        const data = await response.json().catch(() => ({}));
+        showConversionAlert(data.error || `HTTP ${response.status}`);
+        return;
+      }
+      const version = response.headers.get("X-Bom-Version") || "x";
+      const blob = await response.blob();
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = `standard_piece_qty_v${version}.csv`;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(url);
+    } catch (error) {
+      showConversionAlert(error.message);
+    }
+  }
+
   function bind() {
     $("btn-stage-upsert").addEventListener("click", () => stage("upsert"));
     $("btn-stage-delete").addEventListener("click", () => stage("delete"));
@@ -305,6 +447,14 @@
     $("f-qty").addEventListener("keydown", (event) => {
       if (event.key === "Enter") stage("upsert");
     });
+    $("file-detail").addEventListener("change", (event) => {
+      state.conversionFiles.detail = event.target.files[0] || null;
+    });
+    $("file-rules").addEventListener("change", (event) => {
+      state.conversionFiles.rules = event.target.files[0] || null;
+    });
+    $("btn-conversion-check").addEventListener("click", runConversionCheck);
+    $("btn-conversion-download").addEventListener("click", downloadValidRows);
   }
 
   bind();

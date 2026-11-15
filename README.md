@@ -27,7 +27,7 @@ python -m venv .venv && . .venv/bin/activate
 pip install -r requirements.txt
 uvicorn app.main:app --port 8000            # 第二个进程换端口即可
 python scripts/concurrency_demo.py           # 起两个真实进程做交错验证
-pytest -q                                    # 55 项测试
+pytest -q                                    # 87 项测试
 ```
 
 ## 功能与约束
@@ -47,6 +47,34 @@ pytest -q                                    # 55 项测试
 | 查看/下载不混两个提交、不临时展开 | 每次请求在其读事务内解析一次 `bom_head`，只 SELECT 物化行 |
 | 重启保留结果 | 数据在卷 `bom-data` 的 SQLite 文件中；版本与用量行都在 |
 | 共享子装配 / 叶件转装配件 / 可暂停计算的交错修改样例 | 见下文 |
+| 供应商箱/包领料换算成标准「件」并核查 | 见「领料明细换算核查」；`app/conversion.py` + `/api/conversion/*` |
+
+## 领料明细换算核查
+
+供应商按箱、包等包装单位报送叶件领料，需要换算成 BOM 的标准单位「件」才能入仓。
+页面底部的「领料明细换算核查」面板上传两个 CSV：
+
+- 领料明细：`line_id, leaf_part, unit, qty`（`qty` 支持小数，按十进制有理数精确解析）
+- 料号专属换算：`leaf_part, from_unit, to_unit, numerator, denominator`，
+  语义为 `1 from_unit = numerator/denominator to_unit`
+
+样例文件在 `samples/`，可直接上传体验（配合 seed 后的演示 BOM，覆盖有效/隔离/拒收三种结局）。
+
+核查规则：
+
+| 要求 | 实现 |
+| --- | --- |
+| 只处理当前已发布 BOM 的叶件 | `BomStore.published_snapshot()` 在**同一只读事务**内解析发布版本与叶件集合；非叶件/不存在的料号直接拒收并注明 |
+| 双向、跨级推导 | 每条规则同时登记正向边与倒数反向边，DFS 枚举明细单位到「件」的全部简单路径，倍率连乘 |
+| 有理数精确计算 | 全程 `fractions.Fraction`，明细小数直接由整数分子/分母构造，绝不经过 float |
+| 同料号不同倍率即矛盾 | 同一 (料号, 明细单位) 出现多个不同倍率时，列出矛盾路径与涉及规则，并**隔离该料号全部明细**；其他料号照常产出 |
+| 无路径 / 非整数不得入有效结果 | 逐行注明原因（找不到换算路径、结果 `a/b` 不是整数），状态为拒收 |
+| 页面显示原行、标准件数、所据 BOM 版本 | 表格含原行号、原数量、倍率、换算路径、状态/原因与 `v<seq>`；有效行才允许下载 |
+| 另一 Web 进程批改期间不串版本 | 每份报告只依据一次快照解析出的版本；并发提交只影响下一次核查 |
+
+行状态三选一：`valid`（有效，可下载）、`quarantined`（料号规则矛盾，整料号隔离）、
+`rejected`（非叶件 / 无路径 / 非整数 / 明细非法）。下载的有效行 CSV 带
+`X-Bom-Version` 响应头与 `bom_version_seq` 列，保证单版本快照。
 
 ## 并发模型
 
@@ -90,6 +118,8 @@ pytest -q                                    # 55 项测试
 | GET | `/api/leaf-usage?top=&leaf=` | 已落库用量（单快照） |
 | GET | `/api/leaf-usage.csv?top=&leaf=` | 下载 CSV，带 `X-Bom-Version` |
 | GET | `/api/usage-summary` | 只读汇总 |
+| POST | `/api/conversion/check` | multipart 上传 `detail_csv` + `rules_csv`，返回逐行核查报告（含矛盾规则与版本号） |
+| POST | `/api/conversion/valid-rows.csv` | 同口径核查并下载有效行，带 `X-Bom-Version` / `X-Valid-Rows` |
 | POST | `/api/demo/seed` / `/api/demo/promote-leaf` / `/api/demo/interleave/{a,b}` | 演示样例 |
 | GET | `/api/demo/scenarios` | 样例说明 |
 
@@ -108,13 +138,15 @@ pytest -q                                    # 55 项测试
 ## 文件
 
 ```
-app/store.py        SQLite 版本化存储、展开、判环、并发提交
+app/store.py        SQLite 版本化存储、展开、判环、并发提交、发布快照解析
+app/conversion.py   领料换算核查：CSV 解析、倍率图、有理数计算、矛盾隔离
 app/main.py         FastAPI 应用工厂、API 与页面
 app/demo.py         内置样例数据与交错修改用例
 app/templates/      单页 UI
 app/static/         前端脚本与样式
+samples/            领料明细与换算规则样例 CSV
 scripts/            两进程演示、HTTP 交错验证、种子任务、worker
-tests/              pytest（55 项：展开、判环、原子性、并发、HTTP、UI）
+tests/              pytest（87 项：展开、判环、原子性、并发、HTTP、UI、换算核查）
 docker-compose.yml  双 Web + 种子任务（+ 可选 interleave）
 ```
 
@@ -128,4 +160,6 @@ pytest -q
 覆盖：多路径求和、共享子装配、叶件转装配件、深 DAG 记忆化、整批判环与路径、
 `replace`/`reset`/顺序语义、容量上限、展开失败与写入中途失败的回滚、跨实例持久化、
 展开期间无写锁、迟到展开重规划、并发合成环、读写快照一致性、CSV 单快照、
-重启保留、两 Web 应用共库，以及模板/JS 元素引用一致性。
+重启保留、两 Web 应用共库、模板/JS 元素引用一致性，以及换算核查的精确有理数计算、
+双向跨级推导、非整数/无路径拒收、矛盾规则整料号隔离且不影响其他料号、
+并发批改期间的单版本一致性与有效行下载快照。
